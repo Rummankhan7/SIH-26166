@@ -561,6 +561,21 @@ PyTorch (optional GPU-aware runtime detection)
 Optional learned-matcher integrations should be enabled only after verifying compatible package versions and GPU availability.
 
 ---
+## Prototype Scope and Validation Status
+
+LunarXReg is a research-oriented MVP designed to demonstrate a complete, reproducible and confidence-aware registration workflow for Chandrayaan-2 multi-sensor imagery.
+
+The publicly available sample products currently used in this prototype were acquired on different dates and may not have confirmed geographic overlap. Therefore, the repository supports two complementary validation modes:
+
+1. **Synthetic Transformation Validation**  
+   A known geometric and illumination transformation is applied to a real lunar input image. The pipeline then estimates the transformation and compares it with known ground truth. This validates feature matching, robust geometry estimation, grid balancing, local refinement and Registration Confidence Score computation.
+
+2. **Real-Pair Feasibility Evaluation**  
+   OHRC–TMC-2 and TMC-2–IIRS pairs are ingested, structurally prepared and evaluated without forcing a result. The pipeline outputs **Accept**, **Review** or **Reject** according to geometric evidence, spatial coverage and confidence thresholds.
+
+A successful real cross-sensor registration requires verified physical overlap, adequate shared terrain structure, compatible acquisition geometry and sufficient illumination support. When an input pair lacks this evidence, LunarXReg reports the limitation rather than generating a misleading alignment.
+
+The architecture is designed to ingest the official SIH-provided overlapping data products when available.
 
 ## Known Limitations
 
