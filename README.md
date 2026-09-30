@@ -1,239 +1,623 @@
-# 🌕 Lunar Multi-Sensor Image Registration Pipeline
+# LunarXReg — Chandrayaan-2 Multi-Modal Image Registration
 
-**Automated, memory-safe co-registration of Chandrayaan-2 OHRC, TMC-2, and IIRS imagery — from raw PDS4 archives to sub-pixel-accurate, geometrically registered products.**
+**A geometry-guided, confidence-aware registration framework for Chandrayaan-2 OHRC, TMC-2 and IIRS imagery.**
+
+> **Diagnose before matching. Match adaptively. Register with confidence.**
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![GDAL](https://img.shields.io/badge/GDAL-Rasterio-2E7D32?logo=gdal&logoColor=white)](https://rasterio.readthedocs.io/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![OpenCV](https://img.shields.io/badge/OpenCV-4.x-5C3EE8?logo=opencv&logoColor=white)](https://opencv.org/)
-[![Platform](https://img.shields.io/badge/Runtime-Google%20Colab-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/)
+[![GDAL](https://img.shields.io/badge/GDAL%20%2F%20Rasterio-Geospatial-2E7D32?logo=gdal&logoColor=white)](https://rasterio.readthedocs.io/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-Optional%20GPU-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Google Colab](https://img.shields.io/badge/Runtime-Google%20Colab-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](#license)
 
 ---
 
-## 📖 Overview
+## Overview
 
-Chandrayaan-2 carries three imaging instruments with wildly different spatial resolutions and no shared reference frame out of the box:
+**LunarXReg** is an adaptive image-correspondence and registration pipeline for Chandrayaan-2 optical imagery. It is designed for the practical difficulty of aligning images acquired by different sensors, at different times, with different illumination, viewing geometry and spatial resolution.
 
-| Instrument | Role | Native GSD | Character |
-|---|---|---|---|
-| **OHRC** (Orbiter High Resolution Camera) | Finest detail | ~0.3 m/px | Narrow, very high-resolution swath |
-| **TMC-2** (Terrain Mapping Camera-2) | Mid-resolution bridge | ~5 m/px | Wider panchromatic strip, GCP-georeferenced |
-| **IIRS** (Imaging Infrared Spectrometer) | Coarsest, hyperspectral | ~80 m/px | 256-band hyperspectral cube, **no per-pixel ground control** |
+The system supports three Chandrayaan-2 payload data types:
 
-This project implements a full **8-stage, production-style geospatial pipeline** that ingests raw PDS4 lunar data and produces sub-pixel co-registered image pairs (**OHRC↔TMC-2** and **TMC-2↔IIRS**), along with quantitative accuracy metrics (RMSE, inlier ratio, spatial coverage) — the deliverables required for a rigorous image-registration evaluation.
+| Instrument | Role in LunarXReg | Approx. spatial resolution | Data character |
+|---|---|---:|---|
+| **OHRC** — Orbiter High Resolution Camera | Fine morphological detail | ~0.25–0.32 m/pixel | High-resolution panchromatic image |
+| **TMC-2** — Terrain Mapping Camera-2 | Intermediate-resolution bridge | ~5 m/pixel | Panchromatic stereo-capable imagery |
+| **IIRS** — Imaging Infrared Spectrometer | Spectral/mineralogical context | ~80 m/pixel | Hyperspectral cube with ~256 bands |
 
-The pipeline is deliberately engineered around one hard constraint: **every stage must run inside a memory-limited Google Colab runtime**, even though OHRC strips and IIRS hyperspectral cubes are far too large to load into RAM in full. This shaped almost every architectural decision below — streamed I/O, windowed reads, decimated matching, and GDAL-native warping instead of in-Python resampling.
+Rather than applying one matcher blindly to every image pair, LunarXReg follows a **diagnose → prepare → route → verify → certify** approach:
 
----
+1. Diagnose scale gap, texture, illumination difference, modality and possible overlap.
+2. Create a structural, illumination-reduced view for matching.
+3. Use the hierarchical bridge:
 
-## 🧭 Problem Statement Summary
+   \[
+   \text{OHRC} \leftrightarrow \text{TMC-2} \leftrightarrow \text{IIRS}
+   \]
 
-> Given raw, unregistered multi-sensor lunar imagery (OHRC, TMC-2, IIRS) at three different resolutions and with inconsistent georeferencing, produce:
-> 1. A **registered image product** aligning the finer sensor onto the coarser sensor's grid,
-> 2. The **match points** used to compute the alignment,
-> 3. A **quantitative evaluation** (accuracy + robustness) of the registration.
+4. Select the most suitable matching route for the image pair.
+5. Verify geometry robustly, balance match distribution, refine locally and quantify confidence.
+6. Return **Accept**, **Review** or **Reject** instead of forcing an unreliable registration.
 
-The core technical challenges this pipeline solves:
+The pipeline produces:
 
-- **No common format** — OHRC/TMC-2 arrive as PDS4-labeled `.img` files, IIRS as ENVI `.qub`/`.hdr` cubes.
-- **No common radiometry** — cross-sensor illumination and dynamic range differ enormously.
-- **No common ground truth** — only OHRC and TMC-2 ship with real per-pixel GCPs; IIRS has none.
-- **No common scale** — a ~250:1 resolution gap between OHRC and IIRS.
-- **No common footprint** — each strip's true geographic overlap is a small fraction of the full scene.
-- **No common memory budget** — full-resolution arrays for these products can exceed a Colab session's RAM outright.
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              RAW PDS4 ARCHIVE                                    │
-│           OHRC (.img)     TMC-2 (.img)     IIRS (.qub + .hdr)                   │
-└───────────────────────────────────┬───────────────────────────────────────────┘
-                                     ▼
-                    ① INGEST  (01_ingest_pds4.ipynb)
-        GDAL PDS4 driver → ENVI driver → manual XML parser fallback
-        Streamed band-by-band write for the 256-band IIRS cube
-                                     ▼
-                    ② RADIOMETRIC NORMALIZATION  (02_radiometric_preprocess.ipynb)
-        Percentile stretch → blockwise CLAHE → streaming PCA (IIRS band reduction)
-                                     ▼
-                    ③ GEOMETRIC PREPROCESSING  (03_geometric_preprocess.ipynb)
-        Real GCP-based georeferencing (OHRC, TMC-2) on a spherical Moon datum
-        Measured ground-sampling-distance (GSD) derived from GCP geometry
-                                     ▼
-                    ③b COMMON-FOOTPRINT CROP  (03b_common_footprint_crop.ipynb)
-        Geographic bbox intersection → orientation-agnostic windowed crop
-        IIRS: label-derived approximate footprint, else full-frame fallback
-                                     ▼
-                    ④ SCALE-SPACE CONSTRUCTION  (04_scale_space.ipynb)
-        Gaussian pyramid (cv2.pyrDown) driven by REAL measured GSD ratios
-        Aligns fine imagery to the coarse sensor's effective resolution
-                                     ▼
-                    ⑤ CORRESPONDENCE MATCHING  (05_correspondence_matching.ipynb)
-     ┌───────────────┬──────────────────────────┬─────────────────┬──────────────┐
-     │     SIFT       │  SuperPoint + LightGlue  │       RoMa       │    MINIMA    │
-     │  (classical)   │   (learned, sparse)      │  (dense, robust) │ (modality-inv)│
-     └───────────────┴──────────────────────────┴─────────────────┴──────────────┘
-        Decimated-read matching + coordinate rescale-back to full resolution
-                                     ▼
-                    ⑥ OUTLIER REJECTION & WARPING  (06_transform_and_warp.ipynb)
-        MAGSAC/RANSAC homography fit → best-of-3-methods selection
-        Uniform spatial-coverage enforcement (8×8 grid)
-        Sub-pixel refinement (windowed phase correlation)
-        gdalwarp-based resampling (block-wise, memory-safe)
-                                     ▼
-                    ⑦ EVALUATION & REPORT  (07_evaluate.ipynb)
-        Held-out RMSE • inlier ratio • coverage score • checkerboard QA
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                             FINAL DELIVERABLES                                  │
-│   registered.tif   •   match_points.csv   •   evaluation_report.json /csv       │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Design principle throughout:** every notebook reads the manifest produced by the previous one and writes both an output artifact *and* an updated manifest — the pipeline is a chain of small, independently re-runnable, disk-backed stages rather than one monolithic in-memory script.
+- Registered image-space output and GeoTIFF **only when valid georeferencing is available**.
+- Uniformly distributed match points.
+- Transformation matrix and metadata.
+- Before/after overlays and checkerboard visual QA.
+- RMSE, inlier count, inlier ratio, spatial coverage and transform-stability metrics.
+- A **Registration Confidence Score (RCS)** and final reliability decision.
 
 ---
 
-## 🛠️ Tech Stack — What & Why
+## Problem Context
 
-| Technology | Used For | Why This Choice |
+The problem requires multi-modal, Sun-angle and scale-invariant correspondence across Chandrayaan-2 OHRC, TMC-2 and IIRS imagery.
+
+### Core challenges
+
+| Challenge | Why it is difficult | LunarXReg response |
 |---|---|---|
-| **Rasterio / GDAL** | Reading PDS4/ENVI rasters, windowed I/O, GCP-based georeferencing, format conversion | The only libraries with native **PDS4** and **ENVI** drivers, plus windowed/decimated reads that avoid materializing full-resolution arrays in RAM — essential given OHRC/IIRS file sizes |
-| **`gdalwarp` / `gdal_translate` (CLI, via `subprocess`)** | Final image resampling onto the reference grid | GDAL warps **block-by-block internally** in C, unlike `cv2.warpPerspective`, which requires the entire source array in memory — the only viable way to resample a full-resolution OHRC strip in Colab |
-| **OpenCV (`cv2`)** | CLAHE contrast enhancement, SIFT detection, homomorphic filtering, RANSAC/MAGSAC transform fitting, phase-correlation refinement | Mature, fast, battle-tested implementations of classical CV primitives; `USAC_MAGSAC` gives a more robust fit than plain RANSAC when available, with automatic fallback |
-| **PyTorch** | Backend runtime for the learned matchers (SuperPoint, LightGlue, RoMa) | Required by all three learned-matching models; GPU acceleration is essential for RoMa's dense matching to run in reasonable time |
-| **LightGlue + SuperPoint** (`cvg/LightGlue`) | Fast, sparse, learned feature matching | State-of-the-art learned matcher that is far more robust to illumination/viewpoint differences than SIFT, while remaining lightweight enough to run per-pair in Colab |
-| **RoMa** (`Parskatt/RoMa`) | Dense, robust correspondence estimation | Handles the large scale/viewpoint gaps between sensors (especially TMC-2↔IIRS) better than sparse matchers by estimating a dense warp field rather than discrete keypoints |
-| **MINIMA** (`LSXI7/MINIMA`) | Modality-invariant matching scaffold | Included as an extensible fourth matcher for cross-modal pairs (e.g. panchromatic vs. hyperspectral) where appearance differs more than geometry |
-| **NumPy** | Array manipulation, GCP math, transform application | The common numerical substrate every other library above builds on |
-| **Matplotlib** | Footprint plots, before/after visual QA, match-line diagrams, checkerboard blends | Fast, dependency-light plotting sufficient for inline Colab visual verification at every stage |
-| **PROJ (via `+proj=longlat +a=1737400 +b=1737400`)** | Custom spherical **lunar** coordinate reference system | Avoids depending on whether the runtime's PROJ database ships IAU planetary authority codes — a self-contained CRS definition guarantees reproducibility across environments |
-| **Google Colab + Google Drive** | Compute + persistent storage | Free GPU access for the learned matchers, with Drive as a durable filesystem across sessions for the multi-stage, disk-chained pipeline design |
+| **Illumination variation** | Different Sun azimuth/elevation changes shadows and surface appearance | Structural matching using CLAHE, homomorphic normalization, gradient/edge representations and shadow-confidence masks |
+| **Viewpoint variation** | Different acquisition geometry creates shifts, rotation, scale and local distortion | Available geometry/GCP inspection, robust MAGSAC/USAC verification and local phase-correlation refinement |
+| **Scale variation** | OHRC, TMC-2 and IIRS differ by large resolution ratios | Gaussian pyramids, compatible working resolution and hierarchical OHRC ↔ TMC-2 ↔ IIRS bridging |
+| **Modality variation** | IIRS is hyperspectral while OHRC/TMC-2 are mainly panchromatic | IIRS PCA/selected-band structural view; original hyperspectral cube remains unchanged |
+| **Uncertain overlap** | Different dates may observe different lunar footprints | Overlap diagnostics, explicit confidence thresholds and Reject/Review output rather than forced alignment |
+| **Large data volume** | High-resolution strips and hyperspectral cubes can exceed Colab memory | Windowed reads, decimated working views, tiling, selected-band reads and streaming PCA |
 
 ---
 
-## 🔬 Pipeline Stages in Detail
+## Key Innovation
 
-### ① `01_ingest_pds4.ipynb` — PDS4 Ingestion
-Recursively scans the raw archive for PDS4 `.xml` labels, skipping browse/geometry folders. Reads pixel data using a **three-tier fallback strategy**: GDAL's native PDS4 driver → GDAL's ENVI driver (for `.qub`+`.hdr` IIRS cubes) → a hand-written PDS4 label parser as a last resort. IIRS's 256-band cube is streamed **band-by-band** directly to GeoTIFF to avoid loading the full cube into memory. Produces a `manifest.csv` tracking every converted product.
+### 1. Registration Quality Controller
 
-### ② `02_radiometric_preprocess.ipynb` — Illumination Normalization
-Computes robust percentile stretch bounds from a decimated read, then applies **blockwise CLAHE** (tiled, overlap-padded) so contrast enhancement stays consistent across tile boundaries without ever holding a full-resolution array. IIRS is first reduced from 256 bands to a single representative channel via a **streaming PCA** (computed from randomly sampled row-blocks, never the full cube).
+LunarXReg diagnoses every source–reference pair before registration using:
 
-### ③ `03_geometric_preprocess.ipynb` — Real Ground-Control Georeferencing
-Parses the per-product `geometry/*.csv` GCP files (Longitude/Latitude/Pixel/Scan) that ship alongside OHRC and TMC-2, fits an affine transform with `rasterio.transform.from_gcps`, and attaches a proper CRS on a spherical Moon datum. Also **derives the true ground-sampling distance** from great-circle distances between adjacent GCPs, rather than trusting nominal mission specs. IIRS, lacking any GCP file, is intentionally left unregistered at this stage — its geolocation is inherited transitively later via feature matches to TMC-2.
+- Approximate scale ratio.
+- Image texture availability.
+- Illumination/shadow reliability.
+- Sensor or modality pair type.
+- Available metadata and geometry.
+- Preliminary overlap confidence.
 
-### ③b `03b_common_footprint_crop.ipynb` — Common-Footprint Cropping
-Computes the true geographic bounding-box intersection between sensor pairs and crops both images to just that shared area — using an **orientation-agnostic inverse-transform window computation** (avoiding a sign-convention bug in `rasterio.windows.from_bounds` on GCP-derived transforms) and a **fresh minimal GTiff profile** (avoiding stale tiling metadata conflicts). For IIRS, attempts to recover an approximate 4-corner footprint from PDS4 label bounding coordinates; falls back safely to full-frame passthrough if unavailable. This step means every downstream matcher operates only on pixels that could possibly correspond — dramatically improving match yield and runtime.
+This information routes each pair through the lightest reliable matching path instead of running every deep model for every image.
 
-### ④ `04_scale_space.ipynb` — Scale-Space Construction
-Builds a Gaussian pyramid (`cv2.pyrDown`) on the finer image, selecting the pyramid level whose effective GSD best matches the coarser sensor's GSD — using **measured** (GCP-derived) GSD where available, nominal mission values only as fallback. Preserves and correctly rescales georeferencing transforms through each pyramid level.
+### 2. Hierarchical Resolution Bridge
 
-### ⑤ `05_correspondence_matching.ipynb` — Multi-Method Feature Matching
-Runs **four** correspondence methods per pair for genuine comparison: classical **SIFT**, learned sparse **SuperPoint+LightGlue**, dense robust **RoMa**, and a **MINIMA** scaffold for modality-invariant matching. All matching happens on **GDAL-decimated reads** (capped at a configurable pixel budget) to stay memory-safe, with resulting keypoints **rescaled back** to each image's own full-resolution pixel grid immediately after detection — so downstream stages need no awareness of the decimation.
+Direct OHRC-to-IIRS matching is an extreme cross-scale task. LunarXReg reduces risk by using TMC-2 as a bridge:
 
-### ⑥ `06_transform_and_warp.ipynb` — Outlier Rejection, Refinement & Warping
-For each pair, evaluates all matcher outputs, fits a robust homography via **MAGSAC (falling back to RANSAC)**, and **keeps whichever method yields the most inliers**. Enforces uniform spatial coverage of surviving matches via an 8×8 grid cap, then refines each kept match to **sub-pixel accuracy** using windowed phase correlation. A 20% held-out test split is set aside *before* fitting, purely for an unbiased RMSE later. Final resampling is delegated to **`gdalwarp`**, which handles arbitrarily large rasters block-by-block without a full in-memory decode.
+\[
+\text{OHRC} \leftrightarrow \text{TMC-2} \leftrightarrow \text{IIRS}
+\]
 
-### ⑦ `07_evaluate.ipynb` — Evaluation & Final Report
-Computes held-out RMSE on the test split, reports inlier count/ratio and spatial coverage score from stage ⑥, generates checkerboard-blend and side-by-side visual QA, and compiles a per-pair `evaluation_report.json` plus an aggregate `final_report.csv` — the final submission deliverable.
+The system uses compatible working resolutions and coarse-to-fine Gaussian pyramids. It does **not** claim that simple resampling creates missing spatial detail.
 
----
+### 3. Sun-Neutral Structural Matching
 
-## 📊 Evaluation Metrics
+Matching is performed on derived structural views rather than only raw brightness:
 
-| Metric | Meaning | Computed In |
+- Percentile normalization.
+- CLAHE local-contrast enhancement.
+- Homomorphic illumination normalization.
+- Gradient magnitude and edge structure.
+- Shadow/low-confidence masking.
+- PCA-1 or selected-band structural representations for IIRS.
+
+The original IIRS cube is preserved for science use; only a derived view is used for registration.
+
+### 4. Grid-Balanced Tie Point Selection
+
+LunarXReg prevents a transform from being fitted mainly from one texture-rich or repetitive region.
+
+- The valid overlap is divided into grid cells.
+- Candidate inliers are ranked using reprojection error, matcher confidence and local validity.
+- A limited number of high-quality points is retained per cell.
+- The final transform is refitted using spatially balanced evidence.
+
+### 5. Confidence-Certified Registration
+
+Every registration is assessed using a transparent **Registration Confidence Score (RCS)**.
+
+\[
+\text{RCS} = 100 \times
+\left(
+0.30R +
+0.25I +
+0.20C +
+0.15S +
+0.10L
+\right)
+\]
+
+where:
+
+| Symbol | Component | Meaning |
 |---|---|---|
-| **RMSE (px)** | Residual error on a held-out 20% test split, never seen during transform fitting | `07_evaluate.ipynb` |
-| **Inlier count / ratio** | Geometric consistency of matches under the fitted homography | `06_transform_and_warp.ipynb` |
-| **Coverage score** | Fraction of an 8×8 spatial grid containing at least one inlier match — penalizes matches clustered in one corner | `06_transform_and_warp.ipynb` |
-| **Checkerboard / side-by-side QA** | Visual alignment sanity check between reference and warped-registered product | `07_evaluate.ipynb` |
+| \(R\) | Residual score | Low reprojection RMSE yields higher confidence |
+| \(I\) | Inlier reliability | Uses both inlier count and inlier ratio |
+| \(C\) | Spatial coverage | Measures grid-wide distribution of reliable matches |
+| \(S\) | Transform stability | Measures sensitivity of the fitted transform under resampling |
+| \(L\) | Illumination validity | Rewards matches outside shadow/no-data/low-confidence regions |
+
+### Decision policy
+
+| RCS | Decision | Interpretation |
+|---:|---|---|
+| **≥ 75** | **Accept** | Strong geometric support, adequate coverage and stable transform |
+| **50–74** | **Review** | Partially reliable result; local uncertainty or limited coverage should be inspected |
+| **< 50** | **Reject / Escalate** | Insufficient evidence; try a stronger matcher, a better overlap ROI or manual review |
+
+Hard safety gates can prevent acceptance even when average RCS is high:
+
+- Too few inliers.
+- Low inlier ratio.
+- Low spatial coverage.
+- Invalid or degenerate transform.
+- Non-finite or excessive reprojection error.
+
+> RCS is an evidence-based reliability estimate. It does not guarantee correct registration.
 
 ---
 
-## 📁 Data & Output Layout
+## Architecture
 
-```
-26166_DATA/
-├── raw/{ohrc,tmc2,iirs}/{browse,data,geometry,miscellaneous}/{raw|calibrated}/<date>/...
-└── processed/
-    ├── geotiff/{ohrc,tmc2,iirs}/<product>.tif           # ① ingest
-    ├── manifest.csv
-    ├── radiometric/{ohrc,tmc2,iirs}/<product>.tif        # ② radiometric
-    ├── manifest_radiometric.csv
-    ├── geocoded/{ohrc,tmc2}/<product>.tif                # ③ geometric
-    ├── manifest_geocoded.csv
-    ├── common_crop/{ohrc_to_tmc2,tmc2_to_iirs}/*.tif     # ③b common-footprint crop
-    ├── manifest_common_crop.csv
-    ├── scalespace/<pair>/*.tif                            # ④ scale-space
-    ├── manifest_scalespace.csv
-    ├── matches/<pair>/{sift,lightglue,roma}_raw_matches.csv  # ⑤ matching
-    ├── registered/<pair>/
-    │   ├── registered.tif            ⟵ final registered product
-    │   ├── match_points.csv          ⟵ final match points
-    │   ├── transform_meta.json
-    │   └── evaluation_report.json    ⟵ per-pair metrics
-    └── final_report.csv              ⟵ submission-level summary
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             MULTI-SENSOR INPUT                              │
+│    OHRC (.img + .xml + geometry CSV) -  TMC-2 (.img + .xml + geometry CSV)  │
+│                    IIRS (.qub + .hdr + .xml) -  Browse PNG                  │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. DATA & METADATA INGESTION                                                │
+│  PDS4/XML inspection -  ENVI header parsing -  geometry CSV inspection        │
+│  GDAL/Rasterio first -  XML-assisted binary-reader fallback                  │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. SCENE DIAGNOSIS — Registration Quality Controller                       │
+│  Scale gap -  texture -  illumination/shadow -  modality -  possible overlap    │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. SENSOR-AWARE STRUCTURAL PREPARATION                                     │
+│  CLAHE -  homomorphic normalization -  gradient/edge structure -  shadow mask  │
+│  IIRS PCA/selected-band matching view; original cube preserved              │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. HIERARCHICAL SCALE BRIDGE                                               │
+│         OHRC ↔ TMC-2 ↔ IIRS -  compatible working GSD -  pyramids             │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  5. ADAPTIVE MATCHER CASCADE                                                │
+│  Fast baseline: SIFT / ORB / AKAZE                                          │
+│  Optional learned routes: SuperPoint + LightGlue -  RoMa -  MINIMA            │
+│  Selection is based on verified RCS, not raw match count                    │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  6. ROBUST GEOMETRY VERIFICATION                                            │
+│  USAC_MAGSAC when available → RANSAC fallback                               │
+│  Homography / affine model selection -  outlier rejection -  plausibility     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  7. GRID-BALANCED SUB-PIXEL REFINEMENT                                      │
+│  Uniform tie-point selection -  local phase correlation -  quality checks     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  8. CONFIDENCE-CERTIFIED OUTPUT                                             │
+│  Overlay -  image-space registration / GeoTIFF when valid georef exists      │
+│  Match points -  RCS -  metrics -  HTML/JSON report -  Accept/Review/Reject     │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 Getting Started
+## Data Layout
 
-1. **Mount your data** in Google Drive following the `raw/` layout shown above.
-2. **Open notebooks in order** in Google Colab, `01` → `07`, running each top-to-bottom.
-3. **Enable a GPU runtime** (`Runtime → Change runtime type → GPU`) before `05_correspondence_matching.ipynb` — required for LightGlue/RoMa.
-4. Each notebook reads the manifest produced by its predecessor — re-running any single notebook is safe as long as upstream manifests still exist.
-5. Inspect `final_report.csv` for the submission-ready summary of every sensor pair.
+Expected Google Drive root:
 
-### Dependencies
+```text
+MyDrive/
+└── 26166_DATA/
+    ├── raw/
+    │   ├── iirs/
+    │   │   ├── browse/raw/<date>/
+    │   │   │   ├── *_b_brw_*.png
+    │   │   │   └── *_b_brw_*.xml
+    │   │   ├── data/raw/<date>/
+    │   │   │   ├── *_d_img_*.hdr
+    │   │   │   ├── *_d_img_*.qub
+    │   │   │   └── *_d_img_*.xml
+    │   │   └── miscellaneous/raw/<date>/
+    │   │
+    │   ├── ohrc/
+    │   │   ├── browse/calibrated/<date>/
+    │   │   ├── data/calibrated/<date>/
+    │   │   │   ├── *_d_img_*.img
+    │   │   │   └── *_d_img_*.xml
+    │   │   └── geometry/calibrated/<date>/
+    │   │       ├── *_g_grd_*.csv
+    │   │       └── *_g_grd_*.xml
+    │   │
+    │   └── tmc2/
+    │       ├── browse/calibrated/<date>/
+    │       ├── data/calibrated/<date>/
+    │       │   ├── *_d_img_*.img
+    │       │   └── *_d_img_*.xml
+    │       └── geometry/calibrated/<date>/
+    │           ├── *_g_grd_*.csv
+    │           └── *_g_grd_*.xml
+    │
+    └── results/
+        ├── previews/
+        ├── metadata/
+        ├── structural_views/
+        ├── matches/
+        ├── registered/
+        ├── reports/
+        ├── synthetic_validation/
+        └── logs/
+```
+
+The notebook creates the `results/` tree automatically.
+
+---
+
+## Implementation Details
+
+### Data ingestion
+
+LunarXReg uses a layered reader strategy:
+
+1. Attempt GDAL/Rasterio data access.
+2. Parse PDS4 XML labels for dimensions, data type, byte order, offsets, scaling and missing values.
+3. Use NumPy binary-reading fallback for `.img` data when generic readers fail.
+4. Use Spectral Python/ENVI header parsing for IIRS `.hdr + .qub` products.
+5. Use browse PNG files only as a clearly labelled demo fallback if raw-product parsing fails.
+
+The notebook never silently replaces raw data with a browse image. It logs the reason and marks the run accordingly.
+
+### IIRS handling
+
+IIRS is handled as a hyperspectral data product:
+
+- Open only selected bands, row windows or spatial subsets where possible.
+- Estimate memory before attempting full-cube reads.
+- Use PCA-1 or selected spectral bands to create a structural matching view.
+- Preserve the original cube; no registration preprocessing overwrites spectral science data.
+
+### Geometric metadata
+
+For OHRC and TMC-2, geometry CSV files are inspected for possible line/sample and latitude/longitude information.
+
+Geometry metadata may help with:
+
+- Scene inspection.
+- Approximate overlap diagnosis.
+- Optional mapping of matched image points to latitude/longitude.
+- Validation consistency checks.
+
+The MVP does **not** invent a CRS or claim full orthorectification when required metadata are unavailable.
+
+---
+
+## Matching Strategy
+
+### Default robust CPU pipeline
+
+The default MVP uses:
+
+- **SIFT** with ratio-test and mutual-nearest-neighbour filtering.
+- **ORB** fallback for fast binary features.
+- **AKAZE** fallback for nonlinear scale-space features.
+- **USAC_MAGSAC** geometric verification when available.
+- **RANSAC** fallback when USAC_MAGSAC is unavailable.
+- **Affine or homography** selection based on residual quality and transform plausibility.
+- **Local phase correlation** for conservative sub-pixel refinement.
+
+### Optional learned matching
+
+The pipeline exposes optional integration points for:
+
+| Method | Role |
+|---|---|
+| **SuperPoint + LightGlue** | Fast learned sparse correspondence |
+| **RoMa** | Dense correspondence with confidence/certainty estimation |
+| **MINIMA** | Modality-invariant matching for difficult cross-modal cases |
+
+These are optional by default. The core notebook remains functional without GPU access or network-dependent installations.
+
+---
+
+## Output Products
+
+Each run creates a dedicated timestamped result folder:
+
+```text
+results/
+└── <source>_to_<reference>_<timestamp>/
+    ├── previews/
+    ├── metadata/
+    ├── structural_views/
+    ├── matches/
+    │   ├── raw_matches.png
+    │   ├── verified_inliers.png
+    │   ├── grid_balanced_matches.png
+    │   └── grid_coverage_heatmap.png
+    ├── registered/
+    │   ├── registered_image_space.png
+    │   ├── overlay_alpha_blend.png
+    │   ├── overlay_checkerboard.png
+    │   ├── absolute_difference.png
+    │   ├── transform.json
+    │   └── match_points.csv
+    ├── reports/
+    │   ├── metrics.json
+    │   ├── confidence_report.json
+    │   ├── registration_report.html
+    │   └── experiment_summary.csv
+    └── logs/
+        └── lunarxreg.log
+```
+
+### Match-point CSV fields
+
+```text
+source_x_working
+source_y_working
+reference_x_working
+reference_y_working
+source_x_original
+source_y_original
+reference_x_original
+reference_y_original
+reprojection_error_px
+phase_response
+shadow_valid_source
+shadow_valid_reference
+selected_after_grid_balance
+```
+
+### GeoTIFF policy
+
+A GeoTIFF is generated **only** when trustworthy georeferencing/CRS information is available from the input or supplied explicitly.
+
+If valid geographic metadata are unavailable, LunarXReg saves an **image-space registered TIFF/PNG** and explicitly labels it as such. It never invents a lunar CRS, projection or map coordinates.
+
+---
+
+## Evaluation Metrics
+
+| Metric | Description |
+|---|---|
+| **Tentative matches** | Number of matches before robust geometric verification |
+| **Inlier count** | Number of geometrically consistent matches after verification |
+| **Inlier ratio** | Inliers divided by tentative matches |
+| **RMSE** | Root-mean-square reprojection error in image pixels |
+| **Median / P95 residual** | Robust residual statistics that reveal long-tail geometric error |
+| **Coverage score** | Fraction of valid grid cells with retained tie points |
+| **Transform stability** | Variation in warp prediction under bootstrap/resampling tests |
+| **Illumination validity** | Fraction of selected matches outside shadow/no-data regions |
+| **RCS** | Combined 0–100 evidence-based registration confidence score |
+| **Decision** | Accept, Review or Reject |
+
+### Evaluation principle
+
+Where a held-out set of reliable points exists, it is excluded from transform fitting and used for independent residual evaluation.
+
+For synthetic validation, the known synthetic transform provides controlled ground truth. Synthetic validation demonstrates pipeline correctness; it is **not** a substitute for scientific inter-sensor validation on physically overlapping lunar scenes.
+
+---
+
+## Synthetic Validation Mode
+
+The supplied Colab workflow includes a controlled validation mode because images from different acquisition dates may not share a footprint.
+
+Synthetic mode:
+
+1. Loads a real OHRC/TMC-2/IIRS structural view.
+2. Applies known rotation, scale, translation, optional perspective perturbation and illumination change.
+3. Runs the exact same pipeline used in a real pair.
+4. Compares the estimated transform with known ground truth.
+5. Reports corner reprojection error, center displacement and RCS.
+
+Example configuration:
+
+```python
+CONFIG["mode"] = "synthetic_validation"
+CONFIG["synthetic_source_sensor"] = "tmc2"
+```
+
+> Synthetic Transformation Validation confirms technical pipeline behavior. It must be presented as a controlled algorithmic demonstration, not as final Chandrayaan-2 cross-sensor geolocation accuracy.
+
+---
+
+## Real-Pair Mode
+
+For real image-pair experiments:
+
+```python
+CONFIG["mode"] = "real_pair"
+CONFIG["source_sensor"] = "tmc2"
+CONFIG["reference_sensor"] = "ohrc"
+CONFIG["use_browse_preview_first"] = True
+```
+
+Other supported configurations include:
+
+```python
+# High-to-medium resolution attempt
+CONFIG["source_sensor"] = "ohrc"
+CONFIG["reference_sensor"] = "tmc2"
+
+# Medium-to-hyperspectral attempt
+CONFIG["source_sensor"] = "tmc2"
+CONFIG["reference_sensor"] = "iirs"
+
+# Reverse direction
+CONFIG["source_sensor"] = "iirs"
+CONFIG["reference_sensor"] = "tmc2"
+```
+
+A real pair may return **Reject** because acquisition dates, footprints, Sun geometry or available structural overlap may not support reliable correspondence. This is expected safe behavior.
+
+---
+
+## Getting Started
+
+### 1. Upload the data
+
+Arrange data in the `MyDrive/26166_DATA/raw/` structure shown in the **Data Layout** section.
+
+### 2. Open the Colab notebook
+
+Open the LunarXReg Colab notebook and run cells from top to bottom.
+
+### 3. Mount Google Drive
+
+The notebook mounts:
+
+```python
+/content/drive/MyDrive/26166_DATA/raw
+```
+
+and writes all outputs to:
+
+```python
+/content/drive/MyDrive/26166_DATA/results
+```
+
+### 4. Start with synthetic validation
+
+```python
+CONFIG["mode"] = "synthetic_validation"
+CONFIG["synthetic_source_sensor"] = "tmc2"
+```
+
+This provides the most controlled first demo.
+
+### 5. Run a real pair
+
+After confirming ingestion and synthetic validation:
+
+```python
+CONFIG["mode"] = "real_pair"
+CONFIG["source_sensor"] = "tmc2"
+CONFIG["reference_sensor"] = "ohrc"
+```
+
+### 6. Review the final dashboard
+
+The notebook displays:
+
+- Source and reference structural views.
+- Raw and verified matches.
+- Grid-balanced correspondences.
+- Registration overlay and checkerboard.
+- RMSE, coverage, inlier statistics and RCS.
+- Final **Accept / Review / Reject** result.
+- Google Drive output paths.
+
+---
+
+## Dependencies
+
+The CPU-compatible MVP uses:
+
 ```bash
-pip install rasterio pyproj tqdm opencv-python torch numpy matplotlib
-pip install git+https://github.com/cvg/LightGlue.git
-pip install git+https://github.com/Parskatt/RoMa.git
-apt-get install -y gdal-bin python3-gdal
+pip install opencv-contrib-python-headless
+pip install spectral rasterio tifffile pandas scikit-image
+pip install matplotlib seaborn lxml tqdm
 ```
 
+Core libraries:
+
+```text
+Python 3.10+
+NumPy
+OpenCV
+Pandas
+Matplotlib
+Scikit-image
+Spectral Python
+Rasterio / GDAL
+lxml
+PyTorch (optional GPU-aware runtime detection)
+```
+
+Optional learned-matcher integrations should be enabled only after verifying compatible package versions and GPU availability.
+
 ---
 
-## ⚠️ Known Limitations
+## Known Limitations
 
-- **IIRS has no independent ground truth** in this dataset (no `geometry/` GCP file) — its absolute geolocation accuracy is bounded by the quality of its matched-pixel chain through TMC-2, not by any direct measurement.
-- The OHRC↔TMC-2 approximate footprint check should be verified visually (Notebook 03, §4) before investing in matching, since the sample acquisitions are several years apart and could in principle cover different ground.
-- Homography order defaults to 1 (affine-like); order 2 is worth trying when ≥10 well-spread GCPs are available and RMSE is higher than expected.
+- **Physical overlap is required.** Separate Chandrayaan-2 acquisitions may observe different lunar footprints; the pipeline must not force a result.
+- **Browse images are not equivalent to calibrated science products.** They are used only as clearly labelled preview/demo fallbacks when raw-product ingestion fails.
+- **IIRS direct absolute control may be limited.** Its alignment can be supported through TMC-2, but propagated uncertainty must be reported.
+- **Pretrained learned matchers may exhibit lunar domain gap.** Natural-image training may not generalize perfectly to repeated crater textures, extreme shadows or spectral representations.
+- **Sub-pixel refinement is local.** Phase correlation refines local image-space offsets; it does not by itself prove sub-pixel geolocation accuracy.
+- **GeoTIFF output depends on valid input georeferencing.** The pipeline will not fabricate a lunar projection or CRS.
+- **A global homography is not always physically sufficient.** Local terrain, pushbroom acquisition geometry and residual sensor distortion may require tiled/local models in future upgrades.
+- **The default notebook prioritizes a reliable CPU-compatible MVP.** Learned models are optional enhancements, not prerequisites.
 
 ---
 
-## 📜 License
+## Future Extensions
+
+- Camera-model and SPICE-kernel integration for improved geometry initialization.
+- DEM-informed map projection and slope-aware transform modelling.
+- Lunar-domain fine-tuning or synthetic relighting augmentation.
+- RoMa/LightGlue/MINIMA production integration with controlled version pinning.
+- Tile-wise local affine / thin-plate-spline correction after stable global initialization.
+- DEM/LOLA/LRO-based independent validation where available.
+- GeoJSON/CSV match exports with reliable latitude/longitude interpolation.
+- Automated overlap prediction from metadata and geometry grids.
+- Interactive analyst review interface for **Review** cases.
+
+---
+
+## Research Foundation
+
+1. Indian Space Science Data Centre (ISSDC), “Chandrayaan-II: ISRO Science Data Archive (ISDA),” PRADAN.  
+   https://pradan.issdc.gov.in/ch2/
+
+2. Indian Space Science Data Centre (ISSDC), “Chandrayaan Data Explorer,” CHMAP Browse.  
+   https://chmapbrowse.issdc.gov.in/
+
+3. P. Lindenberger, P.-E. Sarlin, and M. Pollefeys, “LightGlue: Local Feature Matching at Light Speed,” *Proc. IEEE/CVF ICCV*, 2023, pp. 17627–17638.
+
+4. J. Ren, X. Jiang, Z. Li, D. Liang, X. Zhou, and X. Bai, “MINIMA: Modality Invariant Image Matching,” *Proc. IEEE/CVF CVPR*, 2025, pp. 23059–23068.
+
+5. J. Edstedt, Q. Sun, G. Bökman, M. Wadenbäck, and M. Felsberg, “RoMa: Robust Dense Feature Matching,” *Proc. IEEE/CVF CVPR*, 2024, pp. 19790–19800.
+
+6. D. Baráth, J. Noskova, M. Ivashechkin, and J. Matas, “MAGSAC++, a Fast, Reliable and Accurate Robust Estimator,” *Proc. IEEE/CVF CVPR*, 2020, pp. 1301–1309.
+
+7. D. DeTone, T. Malisiewicz, and A. Rabinovich, “SuperPoint: Self-Supervised Interest Point Detection and Description,” *Proc. IEEE/CVF CVPR Workshops*, 2018, pp. 224–236.
+
+8. NASA Ames Stereo Pipeline, “Chandrayaan-2 Lunar Orbiter Processing Documentation.”  
+   https://stereopipeline.readthedocs.io/en/latest/examples/chandrayaan2.html
+
+9. Mapbox, “Rasterio Documentation.”  
+   https://rasterio.readthedocs.io/
+
+10. Indian Space Research Organisation (ISRO), “Chandrayaan-2 Begins Spectroscopic Studies of Lunar Surface.”  
+    https://www.isro.gov.in/Chandrayaan2begins.html
+
+---
+
+## License
 
 MIT — see `LICENSE` for details.
-
-==============================================================================================================================
-
-# SIH 26166 — Multi-modal, Sun-angle & Scale-invariant Image Correspondence
-
-Full pipeline (this is your system architecture diagram)
-
-Ingestion — pull PDS4 zip bundles from PRADAN/ISSDC, parse XML labels, convert to GeoTIFF/NumPy via GDAL, cache to Google Drive in a fixed folder structure.
-
-Radiometric preprocessing — per-instrument calibration (already in "Calibrated" product level), then contrast-limited adaptive histogram equalization (CLAHE) or illumination normalization (e.g., homomorphic filtering) to reduce sun-angle-driven contrast differences before feature extraction.
-
-Geometric preprocessing — reproject all three to a common lunar reference frame (use TMC-2 DEM/Ortho + available SPICE geometry kernels for rough initial alignment); this removes gross viewpoint offset before fine matching, so the matcher only has to resolve residual/local distortion.
-
-Scale-space construction — build image pyramids per source so the matcher gets candidate patches at comparable effective GSD (this is what actually solves "scale invariance," not just hoping the network generalizes).
-
-Correspondence generation — run chosen matcher(s) hierarchically (OHRC→TMC2→IIRS) per §4.
-
-Outlier rejection & transform estimation — MAGSAC++ (more robust than plain RANSAC) to fit the geometric model; use affine/homography for locally flat patches, and a higher-order (polynomial / thin-plate-spline / piecewise-affine) model if the DEM shows meaningful relief across the tile, since lunar terrain isn't flat.
-
-Sub-pixel refinement — after coarse matches + transform, do local normalized cross-correlation (NCC) or phase-correlation refinement around each inlier to push accuracy below 1 pixel.
-
-Match distribution / uniformity enforcement — grid the image into an N×N cell layout, cap matches per cell (or resample so every cell contributes at least one inlier), and report a coverage/uniformity score — this is explicitly asked for and easy to lose points on if skipped.
-
-Warping & product generation — warp the source image onto the reference grid, export as GeoTIFF (registered product), export match points as CSV/GeoJSON/shapefile with pixel + map coordinates.
-
-Evaluation & reporting — RMSE (on held-out checkpoints), inlier count, inlier ratio, uniformity score, and a checkerboard/blend visualization for qualitative proof.
